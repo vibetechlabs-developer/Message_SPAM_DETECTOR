@@ -55,6 +55,41 @@ function App() {
     }
   };
 
+  const formatFetchError = (data, res) => {
+    const raw = data?.detail ?? data?.message ?? data?.error;
+    if (typeof raw === 'string' && raw.trim()) {
+      const t = raw.trim();
+      if (t.startsWith('<!DOCTYPE') || t.toLowerCase().startsWith('<html')) {
+        return `Server returned ${res.status} (HTML instead of JSON). Confirm the Vite proxy targets the SalesBooster Django port.`;
+      }
+      return t.length > 240 ? `${t.slice(0, 240)}…` : t;
+    }
+    return `Request failed (${res.status})`;
+  };
+
+  const auditSummaryText = (a) => {
+    if (!a) return '';
+    const issues = (a.critical_issues_found || []).map((line) => `• ${line}`).join('\n');
+    return [
+      `Tech audit — ${a.url}`,
+      `Score: ${a.performance_score} | Status: ${a.status}`,
+      issues,
+      a.outreach_summary ? `\nOutreach: ${a.outreach_summary}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n');
+  };
+
+  const copyAuditSummary = async () => {
+    if (!audit) return;
+    try {
+      await navigator.clipboard.writeText(auditSummaryText(audit));
+      showNotice('success', 'Executive summary copied to clipboard.');
+    } catch {
+      showNotice('error', 'Could not copy to clipboard.');
+    }
+  };
+
   const getLeadWebsite = (lead) => lead.website_url || lead.source_url || '';
 
   useEffect(() => {
@@ -64,6 +99,13 @@ function App() {
       fetchSmtpStatus();
     }
   }, [token]);
+
+  useEffect(() => {
+    if (token && activeTab === 'leads') {
+      fetchLeads();
+      fetchAnalytics();
+    }
+  }, [token, activeTab]);
 
   const authHeader = {
     'Content-Type': 'application/json',
@@ -113,25 +155,30 @@ function App() {
   const fetchLeads = async () => {
     try {
       const res = await fetch(apiUrl('/api/leads'), { headers: authHeader });
+      const data = await parseApiResponse(res);
       if (res.ok) {
-        const data = await res.json();
-        setLeads(data);
+        setLeads(Array.isArray(data) ? data : []);
       } else if (res.status === 401) {
         handleAuthFailure();
+      } else {
+        showNotice('error', formatFetchError(data, res));
       }
     } catch (e) {
       console.error(e);
+      showNotice('error', 'Could not load leads from the server.');
     }
   };
 
   const fetchAnalytics = async () => {
     try {
       const res = await fetch(apiUrl('/api/analytics'), { headers: authHeader });
+      const data = await parseApiResponse(res);
       if (res.ok) {
-        const data = await res.json();
         setAnalytics(data);
       } else if (res.status === 401) {
         handleAuthFailure();
+      } else {
+        showNotice('error', formatFetchError(data, res));
       }
     } catch (e) {
       console.error(e);
@@ -165,7 +212,15 @@ function App() {
       const data = await parseApiResponse(res);
       if (res.ok) {
         setKeywordResult(data);
-        showNotice('success', `Found ${data.new_leads_found} new leads!`);
+        const added = data.new_leads_found ?? 0;
+        if (added === 0) {
+          showNotice(
+            'warning',
+            'No new rows added. Either every URL was already in your list, or saving failed for all URLs—try a different keyword.'
+          );
+        } else {
+          showNotice('success', `Added ${added} new lead(s). Open Lead Manager to review.`);
+        }
         fetchLeads();
         fetchAnalytics();
       } else {
@@ -194,7 +249,15 @@ function App() {
       const data = await parseApiResponse(res);
       if (res.ok) {
         setDiscoveryResult(data.discovery || null);
-        showNotice('success', `Saved ${data.new_leads_found} new leads from public crawlable pages.`);
+        if (data.status === 'partial') {
+          showNotice('warning', data.detail || 'Scrape was blocked; check discovery below and Lead Manager for any placeholder row.');
+        } else {
+          const n = data.new_leads_found ?? 0;
+          showNotice(
+            n > 0 ? 'success' : 'warning',
+            n > 0 ? `Saved ${n} new lead(s). Discovery data is below.` : 'Scrape returned no new unique rows (may already exist).'
+          );
+        }
         fetchLeads();
         fetchAnalytics();
       } else {
@@ -222,21 +285,33 @@ function App() {
       });
       const data = await parseApiResponse(res);
       if (res.ok) {
-        setAudit(data.audit);
-        if (data.audit?.is_mock) {
-          showNotice('warning', data.audit.disclaimer || 'This audit is currently demo data.');
+        if (!data.audit) {
+          setAudit(null);
+          showNotice('error', 'Server returned success but no audit payload.');
         } else {
-          showNotice('success', 'Live audit generated successfully.');
+          setAudit(data.audit);
+          if (data.status === 'degraded') {
+            showNotice('warning', data.detail || 'Showing a fallback audit after an internal error.');
+          } else if (data.audit.status === 'Review Required') {
+            showNotice(
+              'warning',
+              'Large or protected sites often block automated scans. This report is conservative—pitch a verified manual audit as the next step.'
+            );
+          } else if (data.audit.is_mock) {
+            showNotice('warning', data.audit.disclaimer || 'This audit uses simulated or demo data.');
+          } else {
+            showNotice('success', 'Audit report ready for client review.');
+          }
         }
       } else {
         if (res.status === 401) {
           handleAuthFailure();
           return;
         }
-        showNotice('error', data.detail || 'Failed to generate audit.');
+        showNotice('error', formatFetchError(data, res));
       }
     } catch (e) {
-      showNotice('error', 'Error generating audit.');
+      showNotice('error', 'Network error while generating the audit.');
     }
     setLoading(false);
   };
@@ -478,41 +553,52 @@ function App() {
         {activeTab === 'audit' && (
           <div className="tools-grid animate-fade-in">
             <div className="tool-card glass-panel" style={{gridColumn: '1 / -1'}}>
-              <h3>Client's Website URL</h3>
+              <h3>Client website audit</h3>
               <p style={{color: 'var(--text-secondary)', marginBottom: '1rem', fontSize: '0.9rem'}}>
-                Hook clients by generating a 'Lighthouse' style PDF report to show what is broken on their site.
+                Browser-style signals (load, assets, basic SEO/accessibility checks). For enterprise storefronts, expect
+                &quot;Review required&quot;—that is intentional so you never pitch false positives. Follow up with a manual pass.
               </p>
               <div className="input-group">
                 <input type="text" placeholder="https://client-site.com" value={targetUrl} onChange={e => setTargetUrl(e.target.value)} />
-                <button onClick={handleAudit} disabled={loading}>{loading ? 'Analyzing...' : 'Generate Audit Report'}</button>
+                <button onClick={handleAudit} disabled={loading}>{loading ? 'Analyzing…' : 'Generate audit report'}</button>
               </div>
             </div>
 
             {audit && (
               <div className="audit-report glass-panel" style={{gridColumn: '1 / -1', marginTop: '1rem'}}>
-                <div style={{display: 'flex', gap: '2rem', alignItems: 'center'}}>
-                  <div className="score-circle">
-                    {audit.performance_score}
+                <div style={{display: 'flex', flexWrap: 'wrap', gap: '2rem', alignItems: 'center', justifyContent: 'space-between'}}>
+                  <div style={{display: 'flex', gap: '2rem', alignItems: 'center'}}>
+                    <div className="score-circle">
+                      {audit.performance_score}
+                    </div>
+                    <div>
+                      <h2 style={{marginBottom: '0.5rem'}}>Technical audit report</h2>
+                      <p style={{color: 'var(--text-secondary)'}}>Generated for {audit.url}</p>
+                      <p style={{color: 'var(--text-secondary)', marginTop: '0.35rem'}}>
+                        Status:{' '}
+                        <span className={`audit-status audit-status-${(audit.status || '').toLowerCase().replace(/\s+/g, '-')}`}>
+                          {audit.status}
+                        </span>
+                      </p>
+                      {audit.pages_audited ? (
+                        <p style={{color: 'var(--text-secondary)', marginTop: '0.35rem'}}>Pages sampled: {audit.pages_audited}</p>
+                      ) : null}
+                    </div>
                   </div>
-                  <div>
-                    <h2 style={{marginBottom: '0.5rem'}}>Tech Audit Report</h2>
-                    <p style={{color: 'var(--text-secondary)'}}>Generated for {audit.url}</p>
-                    <p style={{color: 'var(--text-secondary)', marginTop: '0.35rem'}}>Status: {audit.status}</p>
-                    {audit.pages_audited ? (
-                      <p style={{color: 'var(--text-secondary)', marginTop: '0.35rem'}}>Pages audited: {audit.pages_audited}</p>
-                    ) : null}
-                  </div>
+                  <button type="button" className="secondary-button" onClick={copyAuditSummary}>
+                    Copy executive summary
+                  </button>
                 </div>
 
                 {audit.disclaimer && (
-                  <div style={{background: 'rgba(255,255,255,0.03)', padding: '0.85rem 1rem', borderRadius: '8px', marginTop: '1.25rem', color: 'var(--text-secondary)'}}>
+                  <div className="audit-disclaimer">
                     {audit.disclaimer}
                   </div>
                 )}
                 
-                <h3 style={{marginTop: '2rem', marginBottom: '1rem'}}>Critical Issues Found</h3>
+                <h3 style={{marginTop: '2rem', marginBottom: '1rem'}}>Critical issues</h3>
                 <ul className="issue-list">
-                  {audit.critical_issues_found.map((issue, idx) => (
+                  {(audit.critical_issues_found || []).map((issue, idx) => (
                     <li key={idx}>{issue}</li>
                   ))}
                 </ul>
@@ -628,7 +714,19 @@ function App() {
                 </thead>
                 <tbody>
                   {leads.length === 0 ? (
-                    <tr><td colSpan="10" style={{textAlign: 'center', padding: '2rem'}}>No leads found in database. Please run a Keyword Search or URL Scraper.</td></tr>
+                    <tr>
+                      <td colSpan="10" style={{ textAlign: 'left', padding: '2rem', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+                        <strong style={{ color: 'var(--text-primary)' }}>Your lead list is empty for this login.</strong>
+                        <br />
+                        <br />
+                        1) Open <strong>Keyword Search</strong>, enter a niche (e.g. &quot;dentist in Austin&quot;), click Start Search—URLs are discovered and a row is stored per site even if email is not public.
+                        <br />
+                        2) Or use <strong>Direct URL Scraper</strong> with a marketing site URL; if the page is blocked you may still get a placeholder lead plus robots/sitemap discovery.
+                        <br />
+                        3) For a client demo without scraping, run:{' '}
+                        <code style={{ color: 'var(--accent-color)' }}>python manage.py seed_demo_leads --username YOUR_USER</code>
+                      </td>
+                    </tr>
                   ) : leads.map((lead) => (
                     <tr key={lead.id}>
                       <td><input type="checkbox" checked={selectedLeads.has(lead.id)} onChange={() => handleToggleLead(lead.id)} /></td>

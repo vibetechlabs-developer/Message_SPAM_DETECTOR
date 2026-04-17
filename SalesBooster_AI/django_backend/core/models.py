@@ -24,6 +24,7 @@ class Lead(models.Model):
     phone = models.CharField(max_length=50, blank=True, null=True)
     lead_score = models.IntegerField(default=0)
     intent_type = models.CharField(max_length=50, default="awareness")
+    website_quality = models.CharField(max_length=20, default="unknown")
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_NEW)
     owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='leads')
 
@@ -33,8 +34,32 @@ class Lead(models.Model):
 class EmailLog(models.Model):
     target_email = models.EmailField()
     subject = models.CharField(max_length=500)
-    status = models.CharField(max_length=50) # success/failed
+    status = models.CharField(max_length=50) # success/failed/queued
     campaign_name = models.CharField(max_length=100, default="default")
     sequence_step = models.IntegerField(default=1)
+    scheduled_at = models.DateTimeField(blank=True, null=True)
     error_msg = models.TextField(blank=True, null=True)
     owner = models.ForeignKey(User, on_delete=models.CASCADE)
+
+
+class LeadTask(models.Model):
+    TYPE_WHATSAPP = "whatsapp"
+    TYPE_CALL = "call"
+    TYPE_CHOICES = [
+        (TYPE_WHATSAPP, "WhatsApp"),
+        (TYPE_CALL, "Call"),
+    ]
+
+    STATUS_PENDING = "pending"
+    STATUS_DONE = "done"
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_DONE, "Done"),
+    ]
+
+    lead = models.ForeignKey(Lead, on_delete=models.CASCADE, related_name="tasks")
+    task_type = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    notes = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(blank=True, null=True)

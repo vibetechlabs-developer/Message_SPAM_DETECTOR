@@ -1,18 +1,36 @@
+import logging
+
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from django.db.models import Count
-from .models import Lead
+from django.utils import timezone
+from .models import Lead, LeadTask, EmailLog
 from .serializers import UserSerializer, LeadSerializer
 from .utils import (
     search_keyword_urls,
     scrape_leads,
     send_bulk_smtp,
     generate_site_audit,
+    generate_mock_audit,
     compute_lead_score,
     get_smtp_config,
+    evaluate_website_quality_from_audit,
+    _normalize_website_url,
+    discover_public_site,
+    truncate_url,
 )
+
+logger = logging.getLogger(__name__)
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def health_view(_request):
+    """Fast check that this Django project is up (used to debug Vite proxy / 502)."""
+    return Response({"ok": True, "service": "salesbooster-django"})
+
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -33,19 +51,29 @@ def keyword_search_view(request):
     urls = search_keyword_urls(keyword)
     new_lead_ids = []
     extracted_preview = []
-    
+
     for url in urls:
-        res = scrape_leads(url)
-        leads_payload = res.get("leads", [])
+        if not url:
+            continue
+        safe_source = truncate_url(url)
+        try:
+            res = scrape_leads(url)
+        except Exception:
+            logger.exception("scrape_leads raised for keyword pipeline url=%s", url)
+            res = {"status": "error", "message": "scrape error"}
+
+        leads_payload = res.get("leads", []) if res.get("status") == "success" else []
         if not leads_payload:
             leads_payload = [{
-                "source": url,
+                "source": safe_source,
                 "contact_name": "",
                 "email": "not_found",
                 "phone": "not_found",
             }]
 
         for l in leads_payload:
+            src = truncate_url(l.get("source") or safe_source)
+            l = {**l, "source": src}
             has_email = l.get('email') and l['email'] != "not_found"
             has_phone = l.get('phone') and l['phone'] != "not_found" and l['phone'] != ""
 
@@ -62,28 +90,31 @@ def keyword_search_view(request):
                 ).exists()
 
             if not exists:
-                score, intent_type = compute_lead_score(
-                    l.get("email", ""), l.get("phone", ""), l["source"], keyword
-                )
-                lead = Lead.objects.create(
-                    keyword=keyword,
-                    source_url=l['source'],
-                    contact_name=l.get('contact_name', ''),
-                    email=l.get('email', 'not_found'),
-                    phone=l.get('phone', 'not_found'),
-                    owner=request.user,
-                    lead_score=score,
-                    intent_type=intent_type
-                )
-                new_lead_ids.append(lead.id)
-                extracted_preview.append({
-                    "source_url": l["source"],
-                    "contact_name": l.get("contact_name", ""),
-                    "email": l.get("email", "not_found"),
-                    "phone": l.get("phone", "not_found"),
-                    "lead_score": score,
-                    "intent_type": intent_type,
-                })
+                try:
+                    score, intent_type = compute_lead_score(
+                        l.get("email", ""), l.get("phone", ""), l["source"], keyword
+                    )
+                    lead = Lead.objects.create(
+                        keyword=keyword,
+                        source_url=l['source'],
+                        contact_name=l.get('contact_name', ''),
+                        email=l.get('email', 'not_found'),
+                        phone=l.get('phone', 'not_found'),
+                        owner=request.user,
+                        lead_score=score,
+                        intent_type=intent_type
+                    )
+                    new_lead_ids.append(lead.id)
+                    extracted_preview.append({
+                        "source_url": l["source"],
+                        "contact_name": l.get("contact_name", ""),
+                        "email": l.get("email", "not_found"),
+                        "phone": l.get("phone", "not_found"),
+                        "lead_score": score,
+                        "intent_type": intent_type,
+                    })
+                except Exception:
+                    logger.exception("Lead.objects.create failed keyword=%s url=%s", keyword, l.get("source"))
                         
     serialized_new_leads = LeadSerializer(
         Lead.objects.filter(id__in=new_lead_ids, owner=request.user).order_by('-lead_score', '-id'),
@@ -105,21 +136,65 @@ def single_url_scrape_view(request):
     if not url:
         return Response({"detail": "URL required."}, status=status.HTTP_400_BAD_REQUEST)
 
+    normalized = truncate_url(_normalize_website_url(url) or url.strip())
+    discovery = discover_public_site(url)
+
     res = scrape_leads(url)
-    
+
     if res.get("status") != "success":
         error_msg = res.get("message", "")
+        stub_saved = 0
+        if not Lead.objects.filter(
+            source_url=normalized, email="not_found", owner=request.user, keyword="Direct URL"
+        ).exists():
+            try:
+                score, intent_type = compute_lead_score("", "", normalized, "Direct URL")
+                Lead.objects.create(
+                    keyword="Direct URL",
+                    source_url=normalized,
+                    contact_name="",
+                    email="not_found",
+                    phone="not_found",
+                    owner=request.user,
+                    lead_score=score,
+                    intent_type=intent_type,
+                )
+                stub_saved = 1
+            except Exception:
+                logger.exception("stub lead create failed for direct url")
+
+        warn = (
+            "Page could not be scraped (blocked, timeout, or non-200). "
+            "A placeholder lead was saved so you can still track this domain in Lead Manager."
+            if stub_saved
+            else "Page could not be scraped and no placeholder was saved (duplicate or invalid URL)."
+        )
         if "403" in error_msg:
-            return Response({"detail": "Aa website ma Anti-Bot Cloudflare Security chhe. Scraper ne block kari didhu."}, status=status.HTTP_403_FORBIDDEN)
-        return Response({"detail": f"Scraping failed: {error_msg}"}, status=status.HTTP_400_BAD_REQUEST)
+            warn = (
+                "Site returned 403 / anti-bot protection. Placeholder lead saved when possible—"
+                "use Keyword Search or a simpler marketing site for live contact extraction."
+                if stub_saved
+                else warn
+            )
+        return Response(
+            {
+                "status": "partial",
+                "new_leads_found": stub_saved,
+                "discovery": discovery,
+                "detail": warn,
+                "scrape_error": error_msg[:500] if error_msg else None,
+            },
+            status=status.HTTP_200_OK,
+        )
 
     all_leads = []
-    
+
     for l in res["leads"]:
+        src = truncate_url(l.get("source") or normalized)
+        l = {**l, "source": src}
         has_email = l['email'] and l['email'] != "not_found"
         has_phone = l['phone'] and l['phone'] != "not_found" and l['phone'] != ""
-        
-        # Always try to save it for direct URL scraper even if no email/phone just so user gets data
+
         exists = False
         if has_email:
             exists = Lead.objects.filter(email=l['email'], owner=request.user).exists()
@@ -127,20 +202,33 @@ def single_url_scrape_view(request):
             exists = Lead.objects.filter(phone=l['phone'], owner=request.user).exists()
         else:
             exists = Lead.objects.filter(source_url=l['source'], email="not_found", owner=request.user).exists()
-            
+
         if not exists:
-            score, intent_type = compute_lead_score(
-                l.get("email", ""), l.get("phone", ""), l["source"], "Direct URL"
-            )
-            Lead.objects.create(
-                keyword="Direct URL", source_url=l['source'],
-                contact_name=l['contact_name'], email=l['email'],
-                phone=l['phone'], owner=request.user,
-                lead_score=score, intent_type=intent_type
-            )
-            all_leads.append(l)
-                    
-    return Response({"status": "success", "new_leads_found": len(all_leads)})
+            try:
+                score, intent_type = compute_lead_score(
+                    l.get("email", ""), l.get("phone", ""), l["source"], "Direct URL"
+                )
+                Lead.objects.create(
+                    keyword="Direct URL",
+                    source_url=l['source'],
+                    contact_name=l.get('contact_name', ''),
+                    email=l['email'],
+                    phone=l['phone'],
+                    owner=request.user,
+                    lead_score=score,
+                    intent_type=intent_type,
+                )
+                all_leads.append(l)
+            except Exception:
+                logger.exception("direct url lead save failed")
+
+    return Response(
+        {
+            "status": "success",
+            "new_leads_found": len(all_leads),
+            "discovery": discovery,
+        }
+    )
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -148,7 +236,37 @@ def api_audit_view(request):
     url = request.data.get('url', '')
     if not url:
         return Response({"detail": "URL required."}, status=status.HTTP_400_BAD_REQUEST)
-    return Response({"status": "success", "audit": generate_site_audit(url)})
+    try:
+        audit = generate_site_audit(url)
+        quality = evaluate_website_quality_from_audit(audit)
+        audit["website_quality"] = quality
+        return Response({"status": "success", "audit": audit})
+    except Exception:
+        logger.exception("generate_site_audit failed")
+        try:
+            normalized = _normalize_website_url(url) or url.strip()
+            audit = generate_mock_audit(normalized)
+            audit["disclaimer"] = (
+                "The live audit pipeline hit an unexpected error. This is a safe demo-style summary "
+                "you can still use in a conversation—always verify claims before sending to a client."
+            )
+            audit["is_mock"] = True
+            audit["status"] = "Review Required"
+            quality = evaluate_website_quality_from_audit(audit)
+            audit["website_quality"] = quality
+            return Response(
+                {
+                    "status": "degraded",
+                    "audit": audit,
+                    "detail": "Recovered with a demo-style audit after an internal error.",
+                },
+                status=status.HTTP_200_OK,
+            )
+        except Exception:
+            return Response(
+                {"detail": "Could not generate an audit. Try again or use a smaller marketing site URL."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -220,6 +338,129 @@ def send_bulk_view(request):
     if success:
         return Response({"status": "Emails queued and logged successfully."})
     return Response({"detail": error_message or "Failed to connect to SMTP server."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def run_scheduled_followups_view(request):
+    """
+    Simple manual cron-like endpoint:
+    - finds queued EmailLog with scheduled_at <= now
+    - sends them and marks status success/failed
+    """
+    config = get_smtp_config()
+    if not config["configured"]:
+        return Response({"detail": "SMTP is not configured on the server."}, status=status.HTTP_400_BAD_REQUEST)
+
+    now = timezone.now()
+    due_logs = EmailLog.objects.filter(
+        owner=request.user,
+        status="queued",
+        scheduled_at__isnull=False,
+        scheduled_at__lte=now,
+    )[:100]
+
+    if not due_logs:
+        return Response({"status": "no_followups_due", "sent": 0})
+
+    try:
+        server = smtplib.SMTP(config["host"], config["port"])
+        if config["use_tls"]:
+            server.starttls()
+        server.login(config["user"], settings.SMTP_PASS)
+    except Exception as e:
+        return Response({"detail": f"SMTP connect failed: {e}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    sent = 0
+    for log in due_logs:
+        try:
+            msg = EmailMessage()
+            msg.set_content(request.data.get("body", "").replace("{email}", log.target_email) or log.subject)
+            msg["Subject"] = log.subject
+            msg["From"] = config["user"]
+            msg["To"] = log.target_email
+            server.send_message(msg)
+            log.status = "success"
+            log.error_msg = ""
+            log.save(update_fields=["status", "error_msg"])
+            sent += 1
+        except Exception as e:
+            log.status = "failed"
+            log.error_msg = str(e)
+            log.save(update_fields=["status", "error_msg"])
+
+    server.quit()
+    return Response({"status": "followups_sent", "sent": sent})
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def create_tasks_for_nonresponders_view(request):
+    """
+    Multi-channel: create WhatsApp/Call tasks for leads that were emailed but not replied.
+    Light implementation: any lead with failed emails becomes a task.
+    """
+    task_type = request.data.get("task_type", LeadTask.TYPE_CALL)
+    if task_type not in {choice[0] for choice in LeadTask.TYPE_CHOICES}:
+        return Response({"detail": "Invalid task type."}, status=status.HTTP_400_BAD_REQUEST)
+
+    failed_emails = EmailLog.objects.filter(
+        owner=request.user,
+        status="failed",
+    ).values_list("target_email", flat=True)
+
+    leads = Lead.objects.filter(owner=request.user, email__in=failed_emails)
+    created = 0
+    for lead in leads:
+        if not lead.phone:
+            continue
+        exists = lead.tasks.filter(task_type=task_type, status=LeadTask.STATUS_PENDING).exists()
+        if exists:
+            continue
+        LeadTask.objects.create(
+            lead=lead,
+            task_type=task_type,
+            notes=f"Auto-created because {lead.email} outreach failed.",
+        )
+        created += 1
+
+    return Response({"status": "tasks_created", "count": created})
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def list_tasks_view(request):
+    tasks = LeadTask.objects.filter(lead__owner=request.user, status=LeadTask.STATUS_PENDING).select_related("lead")
+    payload = []
+    for t in tasks:
+        payload.append({
+            "id": t.id,
+            "lead_id": t.lead.id,
+            "lead_email": t.lead.email,
+            "lead_phone": t.lead.phone,
+            "task_type": t.task_type,
+            "status": t.status,
+            "notes": t.notes or "",
+            "created_at": t.created_at,
+        })
+    return Response(payload)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def complete_task_view(request, task_id):
+    try:
+        task = LeadTask.objects.select_related("lead").get(
+            id=task_id,
+            lead__owner=request.user,
+        )
+    except LeadTask.DoesNotExist:
+        return Response({"detail": "Task not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    task.status = LeadTask.STATUS_DONE
+    task.completed_at = timezone.now()
+    task.save(update_fields=["status", "completed_at"])
+    return Response({"status": "completed", "task_id": task.id})
 
 
 @api_view(['GET'])

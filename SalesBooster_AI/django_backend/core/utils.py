@@ -11,6 +11,7 @@ import time
 import json
 import subprocess
 from pathlib import Path
+from datetime import datetime, timedelta
 from django.conf import settings
 
 def fetch_html_with_fallback(url: str, timeout: int = 15):
@@ -129,12 +130,93 @@ def compute_lead_score(email: str, phone: str, source_url: str, keyword: str):
 
     return min(score, 100), intent
 
+
+def evaluate_website_quality_from_audit(audit: dict):
+    """
+    Map audit performance/status into a simple quality label for leads.
+    """
+    status = (audit or {}).get("status", "") or ""
+    perf = (audit or {}).get("performance_score", "0/100")
+    try:
+        perf_num = int(str(perf).split("/")[0])
+    except Exception:
+        perf_num = 0
+
+    if status == "Review Required" or str(perf).upper().startswith("N"):
+        return "average"
+    if status in {"Excellent", "Good"} or perf_num >= 80:
+        return "good"
+    if status in {"Needs Improvement"} or 55 <= perf_num < 80:
+        return "average"
+    return "poor"
+
 def extract_name_heuristic(soup, url):
     try:
         domain = urlparse(url).netloc.replace('www.', '').split('.')[0].capitalize()
         return f"{domain} Rep"
     except:
         return "Unknown Rep"
+
+
+def truncate_url(url: str, max_len: int = 500) -> str:
+    u = (url or "").strip()
+    if len(u) <= max_len:
+        return u
+    return u[: max_len - 3] + "..."
+
+
+def discover_public_site(url: str) -> dict:
+    """
+    Lightweight robots.txt + sitemap sniffing for the Direct URL UI (no JS required).
+    """
+    out = {
+        "robots_found": False,
+        "scanned_pages": [],
+        "sitemaps": [],
+        "disallow_rules": [],
+        "sitemap_pages_found": [],
+    }
+    try:
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url.strip()
+        parsed = urlparse(url)
+        if not parsed.netloc:
+            return out
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        robots_url = f"{base}/robots.txt"
+        r = fetch_html_with_fallback(robots_url, timeout=10)
+        out["scanned_pages"] = [robots_url]
+        if r.status_code != 200:
+            return out
+        out["robots_found"] = True
+        text = r.text or ""
+        sitemaps = []
+        disallows = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            low = line.lower()
+            if low.startswith("sitemap:"):
+                part = line.split(":", 1)[1].strip()
+                if part.startswith("http"):
+                    sitemaps.append(part)
+            elif low.startswith("disallow:"):
+                disallows.append(line.split(":", 1)[1].strip() or "/")
+        out["sitemaps"] = sitemaps[:5]
+        out["disallow_rules"] = disallows[:20]
+        for sm in sitemaps[:2]:
+            try:
+                sr = fetch_html_with_fallback(sm, timeout=12)
+                if sr.status_code != 200:
+                    continue
+                locs = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", sr.text or "", flags=re.I)
+                out["sitemap_pages_found"].extend(locs[:25])
+            except Exception:
+                continue
+        out["sitemap_pages_found"] = out["sitemap_pages_found"][:30]
+    except Exception:
+        pass
+    return out
+
 
 def scrape_leads(url: str):
     try:
@@ -246,7 +328,7 @@ def get_smtp_config():
     }
 
 
-def send_bulk_smtp(emails, subject, body, user):
+def send_bulk_smtp(emails, subject, body, user, schedule_followups: bool = True):
     from .models import EmailLog
     config = get_smtp_config()
     if not config["configured"]:
@@ -284,7 +366,24 @@ def send_bulk_smtp(emails, subject, body, user):
                     error_msg=str(e),
                     owner=user
                 )
-                
+        # schedule follow-up steps as queued logs
+        if schedule_followups:
+            now = datetime.utcnow()
+            for email in emails:
+                for step, days in ((2, 3), (3, 7)):
+                    try:
+                        EmailLog.objects.create(
+                            target_email=email,
+                            subject=subject,
+                            status="queued",
+                            campaign_name="bulk_campaign",
+                            sequence_step=step,
+                            scheduled_at=now + timedelta(days=days),
+                            owner=user,
+                        )
+                    except Exception:
+                        continue
+
         server.quit()
         return True, None
     except Exception as e:
@@ -300,16 +399,24 @@ def generate_mock_audit(url: str):
         "Slow server response time."
     ]
     selected_issues = random.sample(issues, 3)
-    return {
+    base = {
         "url": url,
         "is_mock": True,
         "performance_score": f"{score}/100",
         "status": "Poor" if score < 60 else "Needs Improvement",
         "critical_issues_found": selected_issues,
+        "technical_observations": [],
+        "pages_audited": 1,
+        "audited_pages": [],
         "disclaimer": "Demo audit only. Results are simulated and not generated from a live Lighthouse scan.",
         "recommendation": "We recommend a full code refactor and UI update. Our tech team can fix this rapidly.",
-        "estimated_cost_to_fix": f"${random.randint(5, 15) * 100}"
+        "estimated_cost_to_fix": f"${random.randint(5, 15) * 100}",
     }
+    insights = _build_sales_insights(
+        base["critical_issues_found"], base["estimated_cost_to_fix"], base["status"], url
+    )
+    base.update(insights)
+    return base
 
 
 def _normalize_website_url(url: str):
@@ -329,6 +436,15 @@ def _status_from_score(score: int):
     if score >= 60:
         return "Needs Improvement"
     return "Poor"
+
+
+def _coerce_int(value, default=0):
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _find_meta_content(soup, names):
@@ -375,7 +491,7 @@ def _run_browser_audit(url: str):
             cwd=str(frontend_dir),
             capture_output=True,
             text=True,
-            timeout=45,
+            timeout=120,
             check=False,
         )
     except Exception:
@@ -494,7 +610,7 @@ def _build_browser_based_audit(normalized_url: str, browser_data: dict):
     issues = []
     confidence = "high"
     observations = []
-    pages_audited = max(1, int(browser_data.get("pagesAudited", 1) or 1))
+    pages_audited = max(1, _coerce_int(browser_data.get("pagesAudited"), 1))
     page_summaries = browser_data.get("pageSummaries") or []
 
     if browser_data.get("blocked"):
@@ -525,26 +641,26 @@ def _build_browser_based_audit(normalized_url: str, browser_data: dict):
 
     dom_content_loaded_ms = browser_data.get("domContentLoadedMs")
     load_event_ms = browser_data.get("loadEventMs")
-    total_bytes = browser_data.get("totalTransferSize", 0)
-    js_requests = browser_data.get("scriptRequests", 0)
-    image_requests = browser_data.get("imageRequests", 0)
-    stylesheet_requests = browser_data.get("stylesheetRequests", 0)
-    total_requests = browser_data.get("totalRequests", 0)
-    failed_request_count = browser_data.get("failedRequestCount", 0)
-    bad_response_count = browser_data.get("badResponseCount", 0)
-    console_error_count = browser_data.get("consoleErrorCount", 0)
-    h1_count = browser_data.get("h1Count", 0)
-    image_count = browser_data.get("imageCount", 0)
-    missing_alt_count = browser_data.get("missingAltCount", 0)
-    oversized_images = browser_data.get("oversizedImages", 0)
-    unlabeled_inputs_count = browser_data.get("unlabeledInputsCount", 0)
-    forms_count = browser_data.get("formsCount", 0)
-    inputs_count = browser_data.get("inputsCount", 0)
-    empty_buttons_count = browser_data.get("emptyButtonsCount", 0)
-    insecure_requests = browser_data.get("insecureRequests", 0)
-    third_party_domains = browser_data.get("thirdPartyDomains", 0)
-    title_length = browser_data.get("titleLength", 0)
-    meta_description_length = browser_data.get("metaDescriptionLength", 0)
+    total_bytes = _coerce_int(browser_data.get("totalTransferSize"), 0)
+    js_requests = _coerce_int(browser_data.get("scriptRequests"), 0)
+    image_requests = _coerce_int(browser_data.get("imageRequests"), 0)
+    stylesheet_requests = _coerce_int(browser_data.get("stylesheetRequests"), 0)
+    total_requests = _coerce_int(browser_data.get("totalRequests"), 0)
+    failed_request_count = _coerce_int(browser_data.get("failedRequestCount"), 0)
+    bad_response_count = _coerce_int(browser_data.get("badResponseCount"), 0)
+    console_error_count = _coerce_int(browser_data.get("consoleErrorCount"), 0)
+    h1_count = _coerce_int(browser_data.get("h1Count"), 0)
+    image_count = _coerce_int(browser_data.get("imageCount"), 0)
+    missing_alt_count = _coerce_int(browser_data.get("missingAltCount"), 0)
+    oversized_images = _coerce_int(browser_data.get("oversizedImages"), 0)
+    unlabeled_inputs_count = _coerce_int(browser_data.get("unlabeledInputsCount"), 0)
+    forms_count = _coerce_int(browser_data.get("formsCount"), 0)
+    inputs_count = _coerce_int(browser_data.get("inputsCount"), 0)
+    empty_buttons_count = _coerce_int(browser_data.get("emptyButtonsCount"), 0)
+    insecure_requests = _coerce_int(browser_data.get("insecureRequests"), 0)
+    third_party_domains = _coerce_int(browser_data.get("thirdPartyDomains"), 0)
+    title_length = _coerce_int(browser_data.get("titleLength"), 0)
+    meta_description_length = _coerce_int(browser_data.get("metaDescriptionLength"), 0)
     has_canonical = browser_data.get("hasCanonical", False)
     has_noindex = browser_data.get("hasNoindex", False)
 

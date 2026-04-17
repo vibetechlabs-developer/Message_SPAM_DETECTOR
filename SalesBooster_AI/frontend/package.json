@@ -4,6 +4,8 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "django": "cd ../django_backend && python manage.py runserver",
+    "django:8001": "cd ../django_backend && python manage.py runserver 8001",
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",

@@ -105,6 +105,49 @@
   word-break: break-word;
 }
 
+.secondary-button {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  padding: 0.55rem 1.1rem;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.secondary-button:hover {
+  border-color: var(--accent-color);
+  color: var(--accent-color);
+}
+
+.audit-disclaimer {
+  background: rgba(255, 255, 255, 0.04);
+  padding: 0.85rem 1rem;
+  border-radius: 8px;
+  margin-top: 1.25rem;
+  color: var(--text-secondary);
+  border-left: 3px solid var(--accent-color);
+}
+
+.audit-status {
+  font-weight: 600;
+  color: var(--accent-color);
+}
+
+.audit-status-needs-improvement,
+.audit-status-poor {
+  color: #f59e0b;
+}
+
+.audit-status-review-required {
+  color: #fbbf24;
+}
+
+.audit-status-excellent,
+.audit-status-good {
+  color: #34d399;
+}
+
 .discovery-list {
   display: flex;
   flex-direction: column;

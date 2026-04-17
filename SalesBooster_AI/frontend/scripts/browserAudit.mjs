@@ -204,10 +204,13 @@ async function auditPage(context, pageUrl) {
   });
 
   try {
+    // `networkidle` rarely completes on large SPAs (analytics, websockets). Prefer DOM-ready + short settle.
     const response = await page.goto(pageUrl, {
-      waitUntil: 'networkidle',
-      timeout: 30000,
+      waitUntil: 'domcontentloaded',
+      timeout: 55000,
     });
+    await page.waitForLoadState('load', { timeout: 20000 }).catch(() => {});
+    await page.evaluate(() => new Promise((r) => setTimeout(r, 900)));
 
     const metrics = await collectPageMetrics(page);
     const finalUrl = page.url();
@@ -260,8 +263,51 @@ const context = await browser.newContext({
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
 });
 
+function blockedPayload(reason) {
+  return {
+    status: null,
+    finalUrl: targetUrl,
+    title: '',
+    hasMetaDescription: false,
+    hasViewport: false,
+    htmlLang: '',
+    h1Count: 0,
+    formsCount: 0,
+    inputsCount: 0,
+    unlabeledInputsCount: 0,
+    buttonsCount: 0,
+    emptyButtonsCount: 0,
+    imageCount: 0,
+    missingAltCount: 0,
+    oversizedImages: 0,
+    internalLinkCount: 0,
+    externalLinkCount: 0,
+    insecureRequests: 0,
+    thirdPartyDomains: 0,
+    titleLength: 0,
+    metaDescriptionLength: 0,
+    hasCanonical: false,
+    hasNoindex: false,
+    domContentLoadedMs: null,
+    loadEventMs: null,
+    totalRequests: 0,
+    scriptRequests: 0,
+    imageRequests: 0,
+    stylesheetRequests: 0,
+    totalTransferSize: 0,
+    failedRequestCount: 0,
+    badResponseCount: 0,
+    consoleErrorCount: 0,
+    blocked: true,
+    pagesAudited: 1,
+    pageSummaries: [{ url: targetUrl, status: null, title: '', blocked: true }],
+    blockedReason: reason || 'navigation_or_timeout',
+  };
+}
+
 try {
   const homepage = await auditPage(context, targetUrl);
+
   const linksToAudit = homepage.blocked ? [] : pickImportantLinks(homepage.url, homepage.internalLinks || []);
   const pages = [homepage];
 
@@ -327,8 +373,8 @@ try {
 
   console.log(JSON.stringify(result));
 } catch (error) {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exit(1);
+  console.log(JSON.stringify(blockedPayload(error instanceof Error ? error.message : String(error))));
+  process.exit(0);
 } finally {
   await context.close();
   await browser.close();
