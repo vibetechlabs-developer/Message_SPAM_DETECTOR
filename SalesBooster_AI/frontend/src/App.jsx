@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import './App.css';
 import { apiUrl } from './api';
 
@@ -28,6 +28,11 @@ function App() {
 
   const [keyword, setKeyword] = useState('');
   const [targetUrl, setTargetUrl] = useState('');
+  const [leadSearch, setLeadSearch] = useState('');
+  const [leadStatusFilter, setLeadStatusFilter] = useState('all');
+  const [leadIntentFilter, setLeadIntentFilter] = useState('all');
+  const [importingCsv, setImportingCsv] = useState(false);
+  const csvInputRef = useRef(null);
 
   const [leads, setLeads] = useState([]);
   const [selectedLeads, setSelectedLeads] = useState(new Set());
@@ -91,6 +96,103 @@ function App() {
   };
 
   const getLeadWebsite = (lead) => lead.website_url || lead.source_url || '';
+
+  const filteredLeads = useMemo(() => {
+    const needle = leadSearch.trim().toLowerCase();
+    return leads.filter((lead) => {
+      const statusOk = leadStatusFilter === 'all' || (lead.status || 'new') === leadStatusFilter;
+      const intentOk = leadIntentFilter === 'all' || (lead.intent_type || 'awareness') === leadIntentFilter;
+      if (!statusOk || !intentOk) return false;
+      if (!needle) return true;
+      const haystack = [
+        lead.contact_name || '',
+        lead.keyword || '',
+        lead.email || '',
+        lead.phone || '',
+        lead.source_url || '',
+        lead.website_url || '',
+      ]
+        .join(' ')
+        .toLowerCase();
+      return haystack.includes(needle);
+    });
+  }, [leads, leadSearch, leadStatusFilter, leadIntentFilter]);
+
+  const exportLeadsCsv = () => {
+    if (!filteredLeads.length) {
+      showNotice('warning', 'No rows to export for current filters.');
+      return;
+    }
+    const escapeCell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const rows = [
+      ['Name/Org', 'Keyword/Source', 'Intent', 'Score', 'Extracted Email', 'Phone', 'Website', 'Status'],
+      ...filteredLeads.map((lead) => [
+        lead.contact_name || 'Unknown',
+        lead.keyword || '',
+        lead.intent_type || 'awareness',
+        lead.lead_score ?? 0,
+        lead.email === 'not_found' ? 'Not found' : lead.email,
+        lead.phone && lead.phone !== 'not_found' ? lead.phone : 'N/A',
+        getLeadWebsite(lead) || 'N/A',
+        lead.status || 'new',
+      ]),
+    ];
+    const csv = rows.map((row) => row.map(escapeCell).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const stamp = new Date().toISOString().slice(0, 10);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `salesbooster-leads-${stamp}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    showNotice('success', `Exported ${filteredLeads.length} lead(s) to CSV.`);
+  };
+
+  const openCsvPicker = () => {
+    if (csvInputRef.current) csvInputRef.current.click();
+  };
+
+  const handleCsvImport = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith('.csv')) {
+      showNotice('error', 'Please upload a .csv file.');
+      return;
+    }
+    setImportingCsv(true);
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      const res = await fetch(apiUrl('/api/leads/import-csv'), {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+      });
+      const data = await parseApiResponse(res);
+      if (res.ok) {
+        const created = data.created ?? 0;
+        const skipped = data.skipped ?? 0;
+        showNotice(
+          created > 0 ? 'success' : 'warning',
+          `CSV imported: ${created} created, ${skipped} skipped.`
+        );
+        fetchLeads();
+        fetchAnalytics();
+      } else if (res.status === 401) {
+        handleAuthFailure();
+      } else {
+        showNotice('error', formatFetchError(data, res));
+      }
+    } catch {
+      showNotice('error', 'CSV import failed. Please try again.');
+    } finally {
+      setImportingCsv(false);
+    }
+  };
 
   useEffect(() => {
     if (token) {
@@ -696,6 +798,51 @@ function App() {
                 </p>
               </div>
             </div>
+            <div className="glass-panel lead-toolbar">
+              <input
+                ref={csvInputRef}
+                type="file"
+                accept=".csv,text/csv"
+                style={{ display: 'none' }}
+                onChange={handleCsvImport}
+              />
+              <input
+                className="custom-input"
+                type="text"
+                placeholder="Search by name, email, phone, keyword, or URL..."
+                value={leadSearch}
+                onChange={(e) => setLeadSearch(e.target.value)}
+              />
+              <select
+                className="custom-input lead-filter-select"
+                value={leadStatusFilter}
+                onChange={(e) => setLeadStatusFilter(e.target.value)}
+              >
+                <option value="all">All Statuses</option>
+                <option value="new">New</option>
+                <option value="contacted">Contacted</option>
+                <option value="replied">Replied</option>
+                <option value="meeting">Meeting</option>
+                <option value="won">Won</option>
+                <option value="lost">Lost</option>
+              </select>
+              <select
+                className="custom-input lead-filter-select"
+                value={leadIntentFilter}
+                onChange={(e) => setLeadIntentFilter(e.target.value)}
+              >
+                <option value="all">All Intents</option>
+                <option value="high_intent">High Intent</option>
+                <option value="mid_intent">Mid Intent</option>
+                <option value="awareness">Awareness</option>
+              </select>
+              <button type="button" className="secondary-button" onClick={exportLeadsCsv}>
+                Export CSV ({filteredLeads.length})
+              </button>
+              <button type="button" className="secondary-button" onClick={openCsvPicker} disabled={importingCsv}>
+                {importingCsv ? 'Importing...' : 'Import CSV'}
+              </button>
+            </div>
             <div className="table-container glass-panel">
               <table>
                 <thead>
@@ -713,10 +860,12 @@ function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {leads.length === 0 ? (
+                  {filteredLeads.length === 0 ? (
                     <tr>
                       <td colSpan="10" style={{ textAlign: 'left', padding: '2rem', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-                        <strong style={{ color: 'var(--text-primary)' }}>Your lead list is empty for this login.</strong>
+                        <strong style={{ color: 'var(--text-primary)' }}>
+                          {leads.length === 0 ? 'Your lead list is empty for this login.' : 'No rows match current filters.'}
+                        </strong>
                         <br />
                         <br />
                         1) Open <strong>Keyword Search</strong>, enter a niche (e.g. &quot;dentist in Austin&quot;), click Start Search—URLs are discovered and a row is stored per site even if email is not public.
@@ -727,7 +876,7 @@ function App() {
                         <code style={{ color: 'var(--accent-color)' }}>python manage.py seed_demo_leads --username YOUR_USER</code>
                       </td>
                     </tr>
-                  ) : leads.map((lead) => (
+                  ) : filteredLeads.map((lead) => (
                     <tr key={lead.id}>
                       <td><input type="checkbox" checked={selectedLeads.has(lead.id)} onChange={() => handleToggleLead(lead.id)} /></td>
                       <td>{lead.contact_name || 'Unknown'}</td>

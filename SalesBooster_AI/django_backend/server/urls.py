@@ -13,6 +13,7 @@ urlpatterns = [
     path('api/scrape-url', views.single_url_scrape_view),
     path('api/audit', views.api_audit_view),
     path('api/leads', views.list_leads_view),
+    path('api/leads/import-csv', views.import_leads_csv_view),
     path('api/leads/<int:lead_id>/status', views.update_lead_status_view),
     path('api/analytics', views.campaign_analytics_view),
     path('api/send-bulk', views.send_bulk_view),

@@ -263,6 +263,18 @@ button:disabled {
   border: 1px solid var(--border-color);
 }
 
+.lead-toolbar {
+  display: grid;
+  grid-template-columns: 1.4fr 0.8fr 0.8fr auto auto;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+  align-items: center;
+}
+
+.lead-filter-select {
+  min-width: 0;
+}
+
 table {
   width: 100%;
   min-width: 900px;
@@ -364,6 +376,10 @@ input[type="checkbox"] {
   .input-group input,
   .input-group .custom-input {
     width: 100%;
+  }
+
+  .lead-toolbar {
+    grid-template-columns: 1fr;
   }
 }
 

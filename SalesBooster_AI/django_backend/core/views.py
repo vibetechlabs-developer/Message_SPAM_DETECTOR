@@ -1,9 +1,12 @@
 import logging
+import csv
+import io
 
 from rest_framework import status
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, parser_classes
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.parsers import MultiPartParser, FormParser
 from django.db.models import Count
 from django.utils import timezone
 from .models import Lead, LeadTask, EmailLog
@@ -274,6 +277,105 @@ def list_leads_view(request):
     leads = Lead.objects.filter(owner=request.user).order_by('-lead_score', '-id')
     serializer = LeadSerializer(leads, many=True)
     return Response(serializer.data)
+
+
+def _first_non_empty(row, keys, default=""):
+    for key in keys:
+        value = (row.get(key) or "").strip()
+        if value:
+            return value
+    return default
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@parser_classes([MultiPartParser, FormParser])
+def import_leads_csv_view(request):
+    csv_file = request.FILES.get("file")
+    if not csv_file:
+        return Response({"detail": "CSV file is required under 'file' field."}, status=status.HTTP_400_BAD_REQUEST)
+    if not csv_file.name.lower().endswith(".csv"):
+        return Response({"detail": "Only .csv files are supported."}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        raw = csv_file.read().decode("utf-8-sig", errors="replace")
+    except Exception:
+        return Response({"detail": "Could not read uploaded file."}, status=status.HTTP_400_BAD_REQUEST)
+
+    reader = csv.DictReader(io.StringIO(raw))
+    if not reader.fieldnames:
+        return Response({"detail": "CSV header row is missing."}, status=status.HTTP_400_BAD_REQUEST)
+
+    created = 0
+    skipped = 0
+    errors = []
+    preview = []
+
+    for idx, original_row in enumerate(reader, start=2):
+        row = {str(k).strip().lower(): (v or "") for k, v in (original_row or {}).items()}
+        source_url = truncate_url(
+            _first_non_empty(row, ["source_url", "website", "url", "source", "domain"])
+        )
+        if not source_url:
+            skipped += 1
+            if len(errors) < 10:
+                errors.append(f"Line {idx}: Missing source URL (source_url/website/url).")
+            continue
+        if not source_url.startswith(("http://", "https://")):
+            source_url = "https://" + source_url
+
+        contact_name = _first_non_empty(row, ["contact_name", "name", "company"], "")
+        email = _first_non_empty(row, ["email", "extracted_email"], "not_found")
+        phone = _first_non_empty(row, ["phone", "mobile", "contact"], "not_found")
+        keyword = _first_non_empty(row, ["keyword", "source_keyword"], "CSV Import")
+        lead_status = _first_non_empty(row, ["status"], "new")
+
+        has_email = email != "not_found"
+        has_phone = phone not in {"", "not_found"}
+        if lead_status not in {choice[0] for choice in Lead.STATUS_CHOICES}:
+            lead_status = Lead.STATUS_NEW
+
+        exists = False
+        if has_email:
+            exists = Lead.objects.filter(email=email, owner=request.user).exists()
+        elif has_phone:
+            exists = Lead.objects.filter(phone=phone, owner=request.user).exists()
+        else:
+            exists = Lead.objects.filter(source_url=source_url, email="not_found", owner=request.user).exists()
+        if exists:
+            skipped += 1
+            continue
+
+        try:
+            score, intent_type = compute_lead_score(email, phone, source_url, keyword)
+            lead = Lead.objects.create(
+                keyword=keyword,
+                source_url=source_url,
+                contact_name=contact_name,
+                email=email,
+                phone=phone,
+                owner=request.user,
+                lead_score=score,
+                intent_type=intent_type,
+                status=lead_status,
+            )
+            created += 1
+            if len(preview) < 5:
+                preview.append({"id": lead.id, "name": lead.contact_name, "email": lead.email, "source_url": lead.source_url})
+        except Exception:
+            skipped += 1
+            if len(errors) < 10:
+                errors.append(f"Line {idx}: Could not create lead row.")
+
+    return Response(
+        {
+            "status": "success",
+            "created": created,
+            "skipped": skipped,
+            "errors": errors,
+            "preview": preview,
+        }
+    )
 
 
 @api_view(['PATCH'])

@@ -1,5 +1,6 @@
 from django.test import TestCase
 from django.contrib.auth.models import User
+from django.core.files.uploadedfile import SimpleUploadedFile
 from rest_framework.test import APIClient
 from unittest.mock import patch
 from .utils import compute_lead_score, generate_mock_audit, generate_site_audit
@@ -209,3 +210,25 @@ class KeywordSearchViewTests(TestCase):
         self.assertEqual(len(response.data["searched_urls"]), 1)
         self.assertEqual(len(response.data["new_leads"]), 1)
         self.assertEqual(response.data["new_leads"][0]["contact_name"], "Example Rep")
+
+
+class LeadsCsvImportTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="csv-user", password="secret123")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def test_import_csv_creates_rows_and_skips_duplicates(self):
+        content = (
+            "name,email,phone,website,keyword,status\n"
+            "Alice,alice@example.com,+911111111111,example.com,plumber,new\n"
+            "Alice2,alice@example.com,+922222222222,example2.com,plumber,new\n"
+            "Bob,not_found,not_found,agency.com,agency,contacted\n"
+        ).encode("utf-8")
+        upload = SimpleUploadedFile("leads.csv", content, content_type="text/csv")
+
+        response = self.client.post("/api/leads/import-csv", {"file": upload}, format="multipart")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["created"], 2)
+        self.assertEqual(response.data["skipped"], 1)
