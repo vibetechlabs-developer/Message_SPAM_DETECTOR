@@ -53,6 +53,7 @@ def keyword_search_view(request):
 
     urls = search_keyword_urls(keyword)
     new_lead_ids = []
+    existing_lead_ids = set()
     extracted_preview = []
 
     for url in urls:
@@ -82,15 +83,24 @@ def keyword_search_view(request):
 
             exists = False
             if has_email:
-                exists = Lead.objects.filter(email=l['email'], owner=request.user).exists()
+                existing = Lead.objects.filter(email=l['email'], owner=request.user).only("id").first()
+                exists = bool(existing)
+                if existing:
+                    existing_lead_ids.add(existing.id)
             elif has_phone:
-                exists = Lead.objects.filter(phone=l['phone'], owner=request.user).exists()
+                existing = Lead.objects.filter(phone=l['phone'], owner=request.user).only("id").first()
+                exists = bool(existing)
+                if existing:
+                    existing_lead_ids.add(existing.id)
             else:
-                exists = Lead.objects.filter(
+                existing = Lead.objects.filter(
                     source_url=l['source'],
                     email="not_found",
                     owner=request.user
-                ).exists()
+                ).only("id").first()
+                exists = bool(existing)
+                if existing:
+                    existing_lead_ids.add(existing.id)
 
             if not exists:
                 try:
@@ -123,13 +133,19 @@ def keyword_search_view(request):
         Lead.objects.filter(id__in=new_lead_ids, owner=request.user).order_by('-lead_score', '-id'),
         many=True
     ).data
+    serialized_existing_leads = LeadSerializer(
+        Lead.objects.filter(id__in=existing_lead_ids, owner=request.user).order_by('-lead_score', '-id'),
+        many=True
+    ).data
     return Response({
         "status": "success",
         "keyword": keyword,
         "new_leads_found": len(new_lead_ids),
+        "existing_leads_found": len(existing_lead_ids),
         "searched_urls": urls,
         "extracted_preview": extracted_preview[:10],
         "new_leads": serialized_new_leads[:10],
+        "existing_leads": serialized_existing_leads[:10],
     })
 
 @api_view(['POST'])

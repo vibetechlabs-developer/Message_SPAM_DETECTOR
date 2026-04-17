@@ -207,6 +207,7 @@ class KeywordSearchViewTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["new_leads_found"], 1)
+        self.assertIn("existing_leads_found", response.data)
         self.assertEqual(len(response.data["searched_urls"]), 1)
         self.assertEqual(len(response.data["new_leads"]), 1)
         self.assertEqual(response.data["new_leads"][0]["contact_name"], "Example Rep")

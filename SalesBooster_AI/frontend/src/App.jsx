@@ -155,6 +155,21 @@ function App() {
     if (csvInputRef.current) csvInputRef.current.click();
   };
 
+  const downloadCsvTemplate = () => {
+    const template =
+      'name,email,phone,website,keyword,status\n' +
+      'John Doe,john@example.com,+911234567890,https://example.com,digital marketing,new\n';
+    const blob = new Blob([template], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'salesbooster-import-template.csv';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
   const handleCsvImport = async (event) => {
     const file = event.target.files?.[0];
     event.target.value = '';
@@ -209,12 +224,26 @@ function App() {
     }
   }, [token, activeTab]);
 
+  useEffect(() => {
+    if (!notice.message) return undefined;
+    const timer = setTimeout(() => setNotice({ type: '', message: '' }), 5000);
+    return () => clearTimeout(timer);
+  }, [notice.message]);
+
   const authHeader = {
     'Content-Type': 'application/json',
     'Authorization': `Bearer ${token}`
   };
 
   const handleAuth = async () => {
+    if (username.trim().length < 3) {
+      showNotice('warning', 'Username must be at least 3 characters.');
+      return;
+    }
+    if (password.length < 6) {
+      showNotice('warning', 'Password must be at least 6 characters.');
+      return;
+    }
     setLoading(true);
     const endpoint = isLogin ? '/api/login' : '/api/register';
     try {
@@ -290,11 +319,13 @@ function App() {
   const fetchSmtpStatus = async () => {
     try {
       const res = await fetch(apiUrl('/api/smtp-status'), { headers: authHeader });
+      const data = await parseApiResponse(res);
       if (res.ok) {
-        const data = await res.json();
         setSmtpStatus(data);
       } else if (res.status === 401) {
         handleAuthFailure();
+      } else {
+        showNotice('error', formatFetchError(data, res));
       }
     } catch (e) {
       console.error(e);
@@ -302,7 +333,7 @@ function App() {
   };
 
   const handleKeywordSearch = async () => {
-    if (!keyword) return;
+    if (!keyword.trim()) return;
     setLoading(true);
     setKeywordResult(null);
     try {
@@ -315,13 +346,26 @@ function App() {
       if (res.ok) {
         setKeywordResult(data);
         const added = data.new_leads_found ?? 0;
+        const existing = data.existing_leads_found ?? 0;
         if (added === 0) {
-          showNotice(
-            'warning',
-            'No new rows added. Either every URL was already in your list, or saving failed for all URLs—try a different keyword.'
-          );
+          if (existing > 0) {
+            showNotice(
+              'success',
+              `No new leads added, but ${existing} matching leads already exist in your database.`
+            );
+          } else {
+            showNotice(
+              'warning',
+              'No new rows added. Try a different keyword/location, or import CSV leads for this niche.'
+            );
+          }
         } else {
-          showNotice('success', `Added ${added} new lead(s). Open Lead Manager to review.`);
+          showNotice(
+            'success',
+            existing > 0
+              ? `Added ${added} new lead(s) and found ${existing} existing lead(s).`
+              : `Added ${added} new lead(s). Open Lead Manager to review.`
+          );
         }
         fetchLeads();
         fetchAnalytics();
@@ -339,7 +383,7 @@ function App() {
   };
 
   const handleDirectScrape = async () => {
-    if (!targetUrl) return;
+    if (!targetUrl.trim()) return;
     setLoading(true);
     setDiscoveryResult(null);
     try {
@@ -376,7 +420,7 @@ function App() {
   };
 
   const handleAudit = async () => {
-    if (!targetUrl) return;
+    if (!targetUrl.trim()) return;
     setLoading(true);
     setAudit(null);
     try {
@@ -425,6 +469,25 @@ function App() {
     setSelectedLeads(newSet);
   };
 
+  const selectedFilteredCount = filteredLeads.filter((lead) => selectedLeads.has(lead.id)).length;
+  const allFilteredSelected = filteredLeads.length > 0 && selectedFilteredCount === filteredLeads.length;
+
+  const toggleSelectAllFiltered = () => {
+    const next = new Set(selectedLeads);
+    if (allFilteredSelected) {
+      filteredLeads.forEach((lead) => next.delete(lead.id));
+    } else {
+      filteredLeads.forEach((lead) => next.add(lead.id));
+    }
+    setSelectedLeads(next);
+  };
+
+  const resetLeadFilters = () => {
+    setLeadSearch('');
+    setLeadStatusFilter('all');
+    setLeadIntentFilter('all');
+  };
+
   const handleSendEmails = async () => {
     if (selectedLeads.size === 0) return showNotice('error', 'Select leads first!');
     if (!smtpStatus.configured) return showNotice('error', 'SMTP is not configured on the server yet.');
@@ -440,12 +503,15 @@ function App() {
           lead_ids: Array.from(selectedLeads)
         })
       });
-      const data = await res.json();
+      const data = await parseApiResponse(res);
       if (res.ok) {
-        showNotice('success', data.status);
+        showNotice('success', data.status || 'Campaign launched successfully.');
         fetchAnalytics();
+      } else if (res.status === 401) {
+        handleAuthFailure();
+      } else {
+        showNotice('error', formatFetchError(data, res));
       }
-      else showNotice('error', data.detail);
     } catch (e) {
       showNotice('error', 'Email trigger failed');
     }
@@ -463,8 +529,8 @@ function App() {
         fetchLeads();
         fetchAnalytics();
       } else {
-        const data = await res.json();
-        showNotice('error', data.detail || 'Status update failed');
+        const data = await parseApiResponse(res);
+        showNotice('error', formatFetchError(data, res));
       }
     } catch (e) {
       showNotice('error', 'Status update failed');
@@ -556,7 +622,7 @@ function App() {
               <div className="tool-card glass-panel" style={{gridColumn: '1 / -1'}}>
                 <h3>Keyword Search Results</h3>
                 <p style={{margin: 0, color: 'var(--text-secondary)'}}>
-                  Keyword: <strong>{keywordResult.keyword}</strong> | New leads found: <strong>{keywordResult.new_leads_found}</strong>
+                  Keyword: <strong>{keywordResult.keyword}</strong> | New leads found: <strong>{keywordResult.new_leads_found}</strong> | Existing matched leads: <strong>{keywordResult.existing_leads_found || 0}</strong>
                 </p>
                 <p style={{margin: 0, color: 'var(--text-secondary)'}}>
                   Websites checked: {(keywordResult.searched_urls || []).length}
@@ -797,6 +863,21 @@ function App() {
                   Funnel: New {analytics.status_breakdown.new} | Contacted {analytics.status_breakdown.contacted} | Replied {analytics.status_breakdown.replied} | Meeting {analytics.status_breakdown.meeting} | Won {analytics.status_breakdown.won} | Lost {analytics.status_breakdown.lost}
                 </p>
               </div>
+              <div className="tool-card glass-panel">
+                <h3 style={{ marginBottom: '0.5rem' }}>Filtered Snapshot</h3>
+                <p style={{ margin: 0, color: 'var(--text-secondary)' }}>Visible rows: <strong>{filteredLeads.length}</strong></p>
+                <p style={{ margin: 0, color: 'var(--text-secondary)' }}>Selected in view: <strong>{selectedFilteredCount}</strong></p>
+                <p style={{ margin: 0, color: 'var(--text-secondary)' }}>
+                  Avg visible score:{' '}
+                  <strong>
+                    {filteredLeads.length
+                      ? Math.round(
+                          filteredLeads.reduce((sum, l) => sum + (Number(l.lead_score) || 0), 0) / filteredLeads.length
+                        )
+                      : 0}
+                  </strong>
+                </p>
+              </div>
             </div>
             <div className="glass-panel lead-toolbar">
               <input
@@ -842,12 +923,25 @@ function App() {
               <button type="button" className="secondary-button" onClick={openCsvPicker} disabled={importingCsv}>
                 {importingCsv ? 'Importing...' : 'Import CSV'}
               </button>
+              <button type="button" className="secondary-button" onClick={downloadCsvTemplate}>
+                CSV Template
+              </button>
+              <button type="button" className="secondary-button" onClick={resetLeadFilters}>
+                Reset Filters
+              </button>
             </div>
             <div className="table-container glass-panel">
               <table>
                 <thead>
                   <tr>
-                    <th>Select</th>
+                    <th>
+                      <input
+                        type="checkbox"
+                        aria-label="Select all filtered leads"
+                        checked={allFilteredSelected}
+                        onChange={toggleSelectAllFiltered}
+                      />
+                    </th>
                     <th>Name/Org</th>
                     <th>Keyword/Source</th>
                     <th>Intent</th>
