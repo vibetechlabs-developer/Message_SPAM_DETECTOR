@@ -53,47 +53,95 @@ def search_keyword_urls(keyword: str):
             # fallback to mock if external API fails
             pass
 
-    try:
-        response = requests.get(
-            "https://html.duckduckgo.com/html/",
-            params={"q": keyword},
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            },
-            timeout=15,
-            verify=False,
-        )
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        urls = []
-        for anchor in soup.select("a.result__a"):
-            href = anchor.get("href", "").strip()
-            if href.startswith("//duckduckgo.com/l/"):
-                parsed = urlparse("https:" + href)
-                uddg = parse_qs(parsed.query).get("uddg", [])
-                if uddg:
-                    href = unquote(uddg[0])
-            elif href.startswith("/l/"):
-                parsed = urlparse("https://duckduckgo.com" + href)
-                uddg = parse_qs(parsed.query).get("uddg", [])
-                if uddg:
-                    href = unquote(uddg[0])
+    def _decode_duckduckgo_redirect(href: str) -> str:
+        raw = (href or "").strip()
+        if not raw:
+            return ""
+        if raw.startswith("//duckduckgo.com/l/"):
+            parsed = urlparse("https:" + raw)
+            uddg = parse_qs(parsed.query).get("uddg", [])
+            return unquote(uddg[0]) if uddg else ""
+        if raw.startswith("/l/"):
+            parsed = urlparse("https://duckduckgo.com" + raw)
+            uddg = parse_qs(parsed.query).get("uddg", [])
+            return unquote(uddg[0]) if uddg else ""
+        return raw
 
-            if href.startswith("http"):
-                urls.append(href)
+    def _looks_like_real_http_url(href: str) -> bool:
+        if not href.startswith(("http://", "https://")):
+            return False
+        parsed = urlparse(href)
+        host = (parsed.netloc or "").lower()
+        if not host:
+            return False
+        blocked_hosts = {
+            "duckduckgo.com",
+            "www.duckduckgo.com",
+            "google.com",
+            "www.google.com",
+            "bing.com",
+            "www.bing.com",
+        }
+        return host not in blocked_hosts
+
+    def _extract_urls_from_html(html: str):
+        soup = BeautifulSoup(html or "", "html.parser")
+        urls = []
+        seen = set()
+
+        selectors = [
+            "a.result__a",
+            "a.result-link",
+            "a[data-testid='result-title-a']",
+            "article h2 a",
+            "h2 a",
+            ".results_links a",
+        ]
+
+        candidate_anchors = []
+        for selector in selectors:
+            candidate_anchors.extend(soup.select(selector))
+        if not candidate_anchors:
+            candidate_anchors = soup.find_all("a", href=True)
+
+        for anchor in candidate_anchors:
+            href = _decode_duckduckgo_redirect(anchor.get("href", ""))
+            if not _looks_like_real_http_url(href):
+                continue
+            if href in seen:
+                continue
+            seen.add(href)
+            urls.append(href)
             if len(urls) >= 10:
                 break
-        if urls:
-            return urls
-    except Exception:
-        pass
+        return urls
 
-    clean_key = keyword.lower().replace(" ", "")
-    return [
-        f"https://www.best{clean_key}.com",
-        f"https://www.{clean_key}agency.net",
-        f"https://www.top-{clean_key}-services.co.uk"
+    search_endpoints = [
+        ("https://html.duckduckgo.com/html/", {"q": keyword}),
+        ("https://lite.duckduckgo.com/lite/", {"q": keyword}),
     ]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+    for endpoint, params in search_endpoints:
+        try:
+            response = requests.get(
+                endpoint,
+                params=params,
+                headers=headers,
+                timeout=15,
+                verify=False,
+            )
+            response.raise_for_status()
+            urls = _extract_urls_from_html(response.text)
+            if urls:
+                return urls
+        except Exception:
+            continue
+
+    # Never return fake domains. If real search fails, return empty list
+    # so the API can report this transparently to the UI.
+    return []
 
 
 def detect_intent_type(keyword: str):

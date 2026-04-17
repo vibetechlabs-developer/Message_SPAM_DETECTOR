@@ -359,6 +359,7 @@ function App() {
             );
           } else {
             const reasonParts = [];
+            if (data.detail) reasonParts.push(data.detail);
             if (attempted > 0) reasonParts.push(`attempted ${attempted}`);
             if (dupes > 0) reasonParts.push(`duplicates ${dupes}`);
             if (scrapeFailed > 0) reasonParts.push(`scrape failed on ${scrapeFailed} site(s)`);

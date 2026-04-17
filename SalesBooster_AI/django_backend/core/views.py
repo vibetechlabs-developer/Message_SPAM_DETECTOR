@@ -52,6 +52,23 @@ def keyword_search_view(request):
         return Response({"detail": "Keyword required."}, status=status.HTTP_400_BAD_REQUEST)
 
     urls = search_keyword_urls(keyword)
+    if not urls:
+        return Response({
+            "status": "success",
+            "keyword": keyword,
+            "new_leads_found": 0,
+            "existing_leads_found": 0,
+            "attempted_rows": 0,
+            "duplicate_rows": 0,
+            "create_failed_rows": 0,
+            "scrape_failed_urls_count": 0,
+            "scrape_failed_urls": [],
+            "searched_urls": [],
+            "extracted_preview": [],
+            "new_leads": [],
+            "existing_leads": [],
+            "detail": "Could not fetch search engine results right now. Try again in a moment or configure SERPAPI_KEY on the server.",
+        })
     new_lead_ids = []
     existing_lead_ids = set()
     extracted_preview = []
