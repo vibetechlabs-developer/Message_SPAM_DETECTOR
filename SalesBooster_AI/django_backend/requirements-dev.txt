@@ -1,0 +1,2 @@
+# Local development & tests (install after requirements.txt)
+-r requirements.txt
