@@ -6,8 +6,11 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   // Must match where SalesBooster Django listens (default: python manage.py runserver → port 8000).
   const apiProxyTarget = env.API_PROXY_TARGET || 'http://127.0.0.1:8000'
+  // Allow deploying under subpaths like /spam/ instead of only domain root.
+  const basePath = env.VITE_BASE_PATH || '/'
 
   return {
+    base: basePath,
     plugins: [react()],
     server: {
       proxy: {

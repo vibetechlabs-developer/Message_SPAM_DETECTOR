@@ -1,0 +1,9 @@
+# env
+django_backend/.env
+frontend/.env
+frontend/.env.production
+
+# generated
+**/__pycache__/
+*.pyc
+django_backend/db.sqlite3
