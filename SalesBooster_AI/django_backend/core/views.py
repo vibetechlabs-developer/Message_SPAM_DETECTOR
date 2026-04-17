@@ -55,6 +55,10 @@ def keyword_search_view(request):
     new_lead_ids = []
     existing_lead_ids = set()
     extracted_preview = []
+    scrape_failed_urls = []
+    create_failed_count = 0
+    duplicate_count = 0
+    attempted_rows = 0
 
     for url in urls:
         if not url:
@@ -65,6 +69,8 @@ def keyword_search_view(request):
         except Exception:
             logger.exception("scrape_leads raised for keyword pipeline url=%s", url)
             res = {"status": "error", "message": "scrape error"}
+        if res.get("status") != "success":
+            scrape_failed_urls.append(safe_source)
 
         leads_payload = res.get("leads", []) if res.get("status") == "success" else []
         if not leads_payload:
@@ -76,6 +82,7 @@ def keyword_search_view(request):
             }]
 
         for l in leads_payload:
+            attempted_rows += 1
             src = truncate_url(l.get("source") or safe_source)
             l = {**l, "source": src}
             has_email = l.get('email') and l['email'] != "not_found"
@@ -127,7 +134,10 @@ def keyword_search_view(request):
                         "intent_type": intent_type,
                     })
                 except Exception:
+                    create_failed_count += 1
                     logger.exception("Lead.objects.create failed keyword=%s url=%s", keyword, l.get("source"))
+            else:
+                duplicate_count += 1
                         
     serialized_new_leads = LeadSerializer(
         Lead.objects.filter(id__in=new_lead_ids, owner=request.user).order_by('-lead_score', '-id'),
@@ -142,6 +152,11 @@ def keyword_search_view(request):
         "keyword": keyword,
         "new_leads_found": len(new_lead_ids),
         "existing_leads_found": len(existing_lead_ids),
+        "attempted_rows": attempted_rows,
+        "duplicate_rows": duplicate_count,
+        "create_failed_rows": create_failed_count,
+        "scrape_failed_urls_count": len(scrape_failed_urls),
+        "scrape_failed_urls": scrape_failed_urls[:10],
         "searched_urls": urls,
         "extracted_preview": extracted_preview[:10],
         "new_leads": serialized_new_leads[:10],

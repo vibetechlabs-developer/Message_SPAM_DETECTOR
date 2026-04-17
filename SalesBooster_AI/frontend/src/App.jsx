@@ -347,6 +347,10 @@ function App() {
         setKeywordResult(data);
         const added = data.new_leads_found ?? 0;
         const existing = data.existing_leads_found ?? 0;
+        const attempted = data.attempted_rows ?? 0;
+        const scrapeFailed = data.scrape_failed_urls_count ?? 0;
+        const createFailed = data.create_failed_rows ?? 0;
+        const dupes = data.duplicate_rows ?? 0;
         if (added === 0) {
           if (existing > 0) {
             showNotice(
@@ -354,10 +358,12 @@ function App() {
               `No new leads added, but ${existing} matching leads already exist in your database.`
             );
           } else {
-            showNotice(
-              'warning',
-              'No new rows added. Try a different keyword/location, or import CSV leads for this niche.'
-            );
+            const reasonParts = [];
+            if (attempted > 0) reasonParts.push(`attempted ${attempted}`);
+            if (dupes > 0) reasonParts.push(`duplicates ${dupes}`);
+            if (scrapeFailed > 0) reasonParts.push(`scrape failed on ${scrapeFailed} site(s)`);
+            if (createFailed > 0) reasonParts.push(`save failed for ${createFailed} row(s)`);
+            showNotice('warning', `No new rows added${reasonParts.length ? ` (${reasonParts.join(', ')})` : ''}. Try another keyword/location.`);
           }
         } else {
           showNotice(
@@ -627,10 +633,15 @@ function App() {
                 <p style={{margin: 0, color: 'var(--text-secondary)'}}>
                   Websites checked: {(keywordResult.searched_urls || []).length}
                 </p>
+                {!!keywordResult.scrape_failed_urls_count && (
+                  <p style={{margin: 0, color: '#fbbf24'}}>
+                    Could not scrape {keywordResult.scrape_failed_urls_count} website(s). Try another niche or use Direct URL Scraper.
+                  </p>
+                )}
 
                 {(keywordResult.new_leads || []).length === 0 ? (
                   <p style={{margin: 0, color: 'var(--text-secondary)'}}>
-                    No new contact records were saved from this search. Try another niche or check Lead Manager for older matching entries.
+                    No new contact records were saved from this search. Check Lead Manager for existing matches or try another niche.
                   </p>
                 ) : (
                   <div className="table-container" style={{marginTop: '1rem'}}>
